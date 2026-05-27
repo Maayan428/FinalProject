@@ -18,7 +18,10 @@ client = Groq(api_key=GROQ_API_KEY)
 
 SYSTEM_PROMPT = """You are a clinical psychology expert analyzing interview transcripts.
 Your task is to rate psychological features based ONLY on what is explicitly stated or clearly implied in the text.
-Always respond in valid JSON format exactly as instructed. Do not add any text outside the JSON."""
+CRITICAL INSTRUCTION: Your response must contain ONLY a JSON object.
+Start your response with { and end with }.
+No text before the JSON. No text after the JSON. No markdown formatting. No explanation.
+The first character of your response must be {"""
 
 def build_user_prompt(segment_text):
     return f"""Analyze the following interview segment spoken by a participant and rate each of the 5 psychological features below.
@@ -70,14 +73,14 @@ FEATURES TO RATE:
    3 = Strong, explicit, or persistent hopelessness about the future
    Use "cannot_determine" only if the future is never mentioned at all.
 
-You MUST respond with ONLY this JSON and nothing else:
-{{
-  "depressed_mood": {{"score": <0-3 or "cannot_determine">, "explanation": "<text>"}},
-  "appetite_changes": {{"score": <0-3 or "cannot_determine">, "explanation": "<text>"}},
-  "guilt_worthlessness": {{"score": <0-3 or "cannot_determine">, "explanation": "<text>"}},
-  "self_focus": {{"score": <0-3 or "cannot_determine">, "explanation": "<text>"}},
-  "hopelessness": {{"score": <0-3 or "cannot_determine">, "explanation": "<text>"}}
-}}"""
+YOUR RESPONSE MUST START WITH {{ AND CONTAIN ONLY THIS JSON STRUCTURE:
+    {{
+      "depressed_mood": {{"score": <0-3 or "cannot_determine">, "explanation": "<text>"}},
+      "appetite_changes": {{"score": <0-3 or "cannot_determine">, "explanation": "<text>"}},
+      "guilt_worthlessness": {{"score": <0-3 or "cannot_determine">, "explanation": "<text>"}},
+      "self_focus": {{"score": <0-3 or "cannot_determine">, "explanation": "<text>"}},
+      "hopelessness": {{"score": <0-3 or "cannot_determine">, "explanation": "<text>"}}
+    }}"""
 
 def parse_response(response_text):
     try:
@@ -175,43 +178,47 @@ def main():
         label = " [RETRY]" if is_retry else ""
         print(f"[{idx+1}/{total}] Participant {pid} | Segment {seg_num} | {row['word_count']} words{label}")
 
-        try:
-            response = client.chat.completions.create(
-                model=MODEL,
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user",   "content": build_user_prompt(text)}
-                ],
-                temperature=0.1,
-                max_tokens=1000,
-            )
-
-            response_text = response.choices[0].message.content.strip()
-            parsed = parse_response(response_text)
-
-            if parsed:
-                result_row = extract_scores(parsed, pid, iid, seg_num)
-                results.append(result_row)
-                scores = {f: parsed[f]["score"] for f in
-                          ["depressed_mood","appetite_changes","guilt_worthlessness",
-                           "self_focus","hopelessness"] if f in parsed}
-                print(f"   Scores: {scores}")
-            else:
-                print(f"   WARNING: Could not parse response")
-                errors.append({"participant_id": pid, "segment_num": seg_num,
-                               "raw_response": response_text})
-                result_row = extract_scores(None, pid, iid, seg_num)
-                results.append(result_row)
-
-        except Exception as e:
-            err_msg = str(e)
-            print(f"   ERROR: {err_msg[:120]}")
-            if "429" in err_msg:
-                print("\n   Daily rate limit reached. Run again tomorrow - progress is saved!")
+        parsed = None
+        for attempt in range(3):
+            try:
+                response = client.chat.completions.create(
+                    model=MODEL,
+                    messages=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": build_user_prompt(text)}
+                    ],
+                    temperature=0.1,
+                    max_tokens=1000,
+                )
+                response_text = response.choices[0].message.content.strip()
+                parsed = parse_response(response_text)
+                if parsed:
+                    break
+                else:
+                    print(f"   Attempt {attempt+1}/3 failed to parse, retrying...")
+                    time.sleep(1)
+            except Exception as e:
+                err_msg = str(e)
+                if "429" in err_msg:
+                    print("\n   Daily rate limit reached. Run again tomorrow!")
+                    with open(progress_file, "w", encoding="utf-8") as f:
+                        json.dump(results, f, ensure_ascii=False, indent=2)
+                    return pd.DataFrame(results)
+                print(f"   ERROR: {err_msg[:120]}")
+                time.sleep(10)
                 break
-            errors.append({"participant_id": pid, "segment_num": seg_num, "error": err_msg})
-            time.sleep(10)
-            continue
+
+        if parsed:
+            result_row = extract_scores(parsed, pid, iid, seg_num)
+            results.append(result_row)
+            scores = {f: parsed[f]["score"] for f in
+                      ["depressed_mood","appetite_changes","guilt_worthlessness",
+                       "self_focus","hopelessness"] if f in parsed}
+            print(f"   Scores: {scores}")
+        else:
+            print(f"   WARNING: Could not parse after 3 attempts")
+            result_row = extract_scores(None, pid, iid, seg_num)
+            results.append(result_row)
 
         with open(progress_file, "w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
